@@ -13,7 +13,7 @@ void HandleSignal(int signum) {
 
 void Usage() {
     std::cout <<
-        "\nUSAGE: dfs-server-p2 [OPTIONS]\n"
+        "\nUSAGE: dfs-server-p1 [OPTIONS]\n"
         "-a, --address <address>:       The server address to connect to (default: 0.0.0.0:42001)\n"
         "-d, --debug_level <level>:  The debug level to use: 0, 1, 2, 3 (default: 0 = no debug, higher numbers increase verbosity)\n"
         "-m, --mount_path <path>:       The mount storage path (default: mnt/server)\n"
@@ -24,7 +24,7 @@ void Usage() {
 
 int main(int argc, char** argv) {
 
-    const char* const short_opts = "a:d:m:n:h";
+    const char* const short_opts = "a:d:m:h";
 
     const option long_opts[] = {
         {"address", optional_argument, nullptr, 'a'},

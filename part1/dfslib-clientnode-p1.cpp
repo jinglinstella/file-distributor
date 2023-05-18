@@ -20,7 +20,6 @@
 #include "dfslib-shared-p1.h"
 #include "dfslib-clientnode-p1.h"
 #include "proto-src/dfs-service.grpc.pb.h"
-//#include "dfslib-shared-p1.cpp"
 
 using grpc::Status;
 using grpc::Channel;
@@ -32,9 +31,9 @@ using grpc::ClientContext;
 using dfs_service::File;
 using dfs_service::FileStatus;
 using dfs_service::Files;
-using dfs_service::FileChunk;
-using dfs_service::FileAck;
-using dfs_service::Empty;
+using dfs_service::FileStream;
+using dfs_service::ServerResponse;
+using dfs_service::VoidArg;
 
 using google::protobuf::RepeatedPtrField;
 using google::protobuf::util::TimeUtil;
@@ -60,7 +59,6 @@ DFSClientNodeP1::DFSClientNodeP1() : DFSClientNode() {}
 
 DFSClientNodeP1::~DFSClientNodeP1() noexcept {}
 
-
 StatusCode DFSClientNodeP1::Store(const std::string &filename) {
 
     //
@@ -80,58 +78,54 @@ StatusCode DFSClientNodeP1::Store(const std::string &filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
-    FileAck response;
 
-    ClientContext context;
-    context.AddMetadata(FileNameMetadataKey, filename);
-    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
 
-    const string& filePath = WrapPath(filename);
-    struct stat fs;
-    if (stat(filePath.c_str(), &fs) != 0){
-        dfs_log(LL_ERROR) << "File " << filePath << " does not exist";
-        return StatusCode::NOT_FOUND;
+    ClientContext client_context;
+    client_context.AddMetadata("file_name", filename);
+    client_context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+
+    const string& file_path = WrapPath(filename);
+    struct stat file_info;
+
+    ifstream ifs(file_path);
+    FileStream file_chunk;
+
+    stat(file_path.c_str(), &file_info);
+    int file_len = file_info.st_size;
+
+    ServerResponse response;
+    unique_ptr<ClientWriter<FileStream>> server_response = service_stub->StoreFile(&client_context, &response);
+
+    int bytes_sent = 0;
+
+    while(bytes_sent < file_len){
+        char buff[10240];
+
+        int bytes_remaining = file_len - bytes_sent;
+        if(bytes_remaining > 10240){
+            bytes_remaining = 10240;
+        }
+
+        ifs.read(buff, bytes_remaining);
+
+        //pass buff content to file_chunk
+        file_chunk.set_contents(buff, bytes_remaining);
+
+        //write file_chunk to the stream
+        server_response->Write(file_chunk);
+        bytes_sent = bytes_sent + bytes_remaining;
+
     }
 
-    int fileSize = fs.st_size;
+    ifs.close();
+    server_response->WritesDone();
+    Status store_status = server_response->Finish();
 
-    unique_ptr<ClientWriter<FileChunk>> resp = service_stub->WriteFile(&context, &response);
-    dfs_log(LL_SYSINFO) << "Storing file " << filePath << "of size " << fileSize;
-    ifstream ifs(filePath);
-    FileChunk chunk;
-
-    int bytesSent = 0;
-    try {
-        while(!ifs.eof() && bytesSent < fileSize){
-            char buffer[ChunkSize];
-            int bytesToSend = min(fileSize - bytesSent, ChunkSize);
-            ifs.read(buffer, bytesToSend);
-            chunk.set_contents(buffer, bytesToSend);
-            resp->Write(chunk);
-            bytesSent += bytesToSend;
-            dfs_log(LL_SYSINFO) << "Stored " << bytesSent << " of " << fileSize << " bytes";
-        }
-        ifs.close();
-        if (bytesSent != fileSize) {
-            stringstream ss;
-            ss << "The impossible happened" << endl;
-            return StatusCode::CANCELLED;
-        }
-    } catch (exception const& e) {
-        dfs_log(LL_ERROR) << "Error while sending file: " << e.what();
-        resp.release();
+    if(!store_status.ok() && store_status.error_code() == StatusCode::INTERNAL){
         return StatusCode::CANCELLED;
     }
-    resp->WritesDone();
-    Status status = resp->Finish();
-    if (!status.ok()) {
-        dfs_log(LL_ERROR) << "Store response message: " << status.error_message() << " code: " << status.error_code();
-        if (status.error_code() == StatusCode::INTERNAL) {
-            return StatusCode::CANCELLED;
-        }
-    }
-    dfs_log(LL_SYSINFO) << "Successfully finished storing: " << response.DebugString();
-    return status.error_code();
+
+    return store_status.error_code();
 }
 
 
@@ -148,7 +142,7 @@ StatusCode DFSClientNodeP1::Fetch(const std::string &filename) {
     // As with the store function, you'll need to stream the
     // contents, so consider the use of gRPC's ClientReader.
     //
-    // The StatusCode response should be:
+    // The StatusCode server_response should be:
     //
     // StatusCode::OK - if all went well
     // StatusCode::DEADLINE_EXCEEDED - if the deadline timeout occurs
@@ -156,39 +150,39 @@ StatusCode DFSClientNodeP1::Fetch(const std::string &filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
-    ClientContext context;
-    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+    ClientContext client_context;
+    client_context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
 
     File request;
     request.set_file_name(filename);
 
-    const string& filePath = WrapPath(filename);
-    unique_ptr<ClientReader<FileChunk>> response = service_stub->GetFile(&context, request);
+    const string& file_path = WrapPath(filename);
+    unique_ptr<ClientReader<FileStream>> server_response = service_stub->FetchFile(&client_context, request);
+
     ofstream ofs;
-    FileChunk chunk;
-    try {
-        while (response->Read(&chunk)) {
-            if (!ofs.is_open()){
-                ofs.open(filePath, ios::trunc);
-            }
-            const string& str = chunk.contents();
-            dfs_log(LL_SYSINFO) << "Writing chunk of size " << str.length() << " bytes";
-            ofs << str;
+    FileStream file_chunk;
+
+    //start writing file to client
+    //use the server_response from calling FetchFile
+    while (server_response->Read(&file_chunk)) {
+        if (!ofs.is_open()){
+
+            //if the file not exist, first open such file
+            ofs.open(file_path, ios::trunc);
         }
-        ofs.close();
-    } catch (exception const& e) {
-        dfs_log(LL_ERROR) << "Error writing to file: " << e.what();
-        response.release();
+
+        ofs << file_chunk.contents();
+
+    }
+    ofs.close();
+
+    Status fetch_status = server_response->Finish();
+
+    if(!fetch_status.ok() && fetch_status.error_code() == StatusCode::INTERNAL){
         return StatusCode::CANCELLED;
     }
-    Status status = response->Finish();
-    if (!status.ok()) {
-        dfs_log(LL_ERROR) << "Fetch response message: " << status.error_message() << " code: " << status.error_code();
-        if (status.error_code() == StatusCode::INTERNAL) {
-            return StatusCode::CANCELLED;
-        }
-    }
-    return status.error_code();
+
+    return fetch_status.error_code();
 }
 
 StatusCode DFSClientNodeP1::Delete(const std::string& filename) {
@@ -201,7 +195,7 @@ StatusCode DFSClientNodeP1::Delete(const std::string& filename) {
     //
     // You will also need to add a request for a write lock before attempting to delete.
     //
-    // If the write lock request fails, you should return a status of RESOURCE_EXHAUSTED
+    // If the write lock request fails, you should return a delete_status of RESOURCE_EXHAUSTED
     // and cancel the current operation.
     //
     // The StatusCode response should be:
@@ -212,23 +206,17 @@ StatusCode DFSClientNodeP1::Delete(const std::string& filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
-    ClientContext context;
-    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+    ClientContext client_context;
+    client_context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
 
     File request;
     request.set_file_name(filename);
 
-    FileAck response;
+    ServerResponse response;
 
-    Status status = service_stub->DeleteFile(&context, request, &response);
-    if (!status.ok()) {
-        dfs_log(LL_ERROR) << "Delete failed - message: " << status.error_message() << ", code: " << status.error_code();
-        if (status.error_code() == StatusCode::INTERNAL) {
-            return StatusCode::CANCELLED;
-        }
-    }
-    dfs_log(LL_SYSINFO) << "Success - response: " << response.DebugString();
-    return status.error_code();
+    Status delete_status = service_stub->DeleteFile(&client_context, request, &response);
+
+    return delete_status.error_code();
 
 }
 
@@ -256,24 +244,18 @@ StatusCode DFSClientNodeP1::List(std::map<std::string,int>* file_map, bool displ
     ClientContext context;
     context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
 
-    Empty request;
+    VoidArg request;
     Files response;
 
-    Status status = service_stub->ListFiles(&context, request, &response);
-    if (!status.ok()) {
-        dfs_log(LL_ERROR) << "List files failed - message: " << status.error_message() << ", code: " << status.error_code();
-        if (status.error_code() == StatusCode::INTERNAL) {
-            return StatusCode::CANCELLED;
-        }
-    }
-    dfs_log(LL_SYSINFO) << "Success - response: " << response.DebugString();
+    Status list_status = service_stub->ListFiles(&context, request, &response);
 
-    for (const FileAck& ack : response.file()) {
-        int seconds = TimeUtil::TimestampToSeconds(ack.modified());
-        file_map->insert(pair<string,int>(ack.file_name(), seconds));
-        dfs_log(LL_SYSINFO) << "Adding " << ack.file_name() << " to file map";
+    int time;
+
+    for (const ServerResponse& file : response.file()) {
+        time = TimeUtil::TimestampToSeconds(file.modified());
+        file_map->insert(pair<string,int>(file.file_name(), time));
     }
-    return status.error_code();
+    return list_status.error_code();
 }
 
 StatusCode DFSClientNodeP1::Stat(const std::string &filename, void* file_status) {
@@ -308,18 +290,20 @@ StatusCode DFSClientNodeP1::Stat(const std::string &filename, void* file_status)
     request.set_file_name(filename);
     FileStatus response;
 
-    Status status = service_stub->GetFileStatus(&context, request, &response);
-    if (!status.ok()) {
-        dfs_log(LL_ERROR) << "Delete failed - message: " << status.error_message() << ", code: " << status.error_code();
-        if (status.error_code() == StatusCode::INTERNAL) {
-            return StatusCode::CANCELLED;
-        }
-    }
-    dfs_log(LL_SYSINFO) << "Success - response: " << response.DebugString();
+    //call server method as if call locally
+    Status status = service_stub->GetStatus(&context, request, &response);
 
     file_status = &response;
 
     return status.error_code();
 }
+
+//
+// STUDENT INSTRUCTION:
+//
+// Add your additional code here, including
+// implementations of your client methods
+//
+
 
 

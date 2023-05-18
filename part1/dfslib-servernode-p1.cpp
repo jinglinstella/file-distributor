@@ -27,21 +27,17 @@ using grpc::ServerBuilder;
 using grpc::string_ref;
 
 using dfs_service::DFSService;
-using dfs_service::FileChunk;
-using dfs_service::FileAck;
+using dfs_service::FileStream;
+using dfs_service::ServerResponse;
 using dfs_service::File;
 using dfs_service::Files;
-using dfs_service::Empty;
+using dfs_service::VoidArg;
 using dfs_service::FileStatus;
 
 using google::protobuf::util::TimeUtil;
 using google::protobuf::Timestamp;
 using google::protobuf::uint64;
 
-//using std::multimap;
-//using std::stringstream;
-//using std::endl;
-//using std::string;
 using namespace std;
 
 
@@ -107,217 +103,187 @@ public:
     // implementations of your protocol service methods
     //
 
-    Status WriteFile(
-            ServerContext* context,
-            ServerReader<FileChunk>* reader,
-            FileAck* response
+    Status StoreFile(
+        ServerContext* context,
+        ServerReader<FileStream>* reader,
+        ServerResponse* response
     ) override {
         const multimap<string_ref, string_ref>& metadata = context->client_metadata();
-        auto fileNameV = metadata.find(FileNameMetadataKey);
-        // File name is missing
-        if (fileNameV == metadata.end()){
-            stringstream ss;
-            ss << "Missing " << FileNameMetadataKey << " in client metadata" << endl;
-            dfs_log(LL_ERROR) << ss.str();
-            return Status(StatusCode::INTERNAL, ss.str());
-        }
+        auto iterator = metadata.find("file_name");
 
-        auto fileName = string(fileNameV->second.begin(), fileNameV->second.end());
+        auto fileName = string(iterator->second.begin(), iterator->second.end());
 
-        const string& filePath = WrapPath(fileName);
+        const string& file_path = WrapPath(fileName);
 
-        dfs_log(LL_SYSINFO) << "Writing file " << filePath;
 
-        FileChunk chunk;
+        FileStream file_chunk; //msg from client
         ofstream ofs;
-        try {
-            while (reader->Read(&chunk)) {
-                if (!ofs.is_open()) {
-                    ofs.open(filePath, ios::trunc); //creates a file with filePath
-                }
 
-                if (context->IsCancelled()){
-                    const string& err = "Request deadline has expired";
-                    dfs_log(LL_ERROR) << err;
-                    return Status(StatusCode::DEADLINE_EXCEEDED, err);
-                }
-
-                const string& chunkStr = chunk.contents();
-                ofs << chunkStr; //write data to file
-                dfs_log(LL_SYSINFO) << "Wrote chunk of size " << chunkStr.length();
+        while (reader->Read(&file_chunk)) {
+            if (!ofs.is_open()) {
+                ofs.open(file_path, ios::trunc);
             }
-            ofs.close();
-        } catch (exception const& e) {
-            stringstream ss;
-            ss << "Error writing to file " << e.what() << endl;
-            dfs_log(LL_ERROR) << ss.str();
-            return Status(StatusCode::INTERNAL, ss.str());
+
+            ofs << file_chunk.contents();
+
         }
-        FileStatus fs;
-        if (getStat(filePath, &fs) != 0) {
-            stringstream ss;
-            ss << "Getting file info for file " << filePath << " failed with: " << strerror(errno) << endl;
-            dfs_log(LL_ERROR) << ss.str();
-            return Status(StatusCode::NOT_FOUND, ss.str());
+        ofs.close();
+
+        struct stat file_info;
+
+        if (stat(file_path.c_str(), &file_info) != 0){
+            return Status(StatusCode::NOT_FOUND, strerror(errno));
         }
+
+        FileStatus file_status;
         response->set_file_name(fileName);
-        Timestamp* modified = new Timestamp(fs.modified());
+        Timestamp* modified = new Timestamp(file_status.modified());
         response->set_allocated_modified(modified);
         return Status::OK;
     }
 
-    Status GetFile(
-            ServerContext* context,
-            const File* request,
-            ServerWriter<FileChunk>* writer
+    Status FetchFile(
+        ServerContext* context, 
+        const File* request,
+        ServerWriter<FileStream>* writer
     ) override {
-        const string& filePath = WrapPath(request->file_name());
-        struct stat fs;
-        if (stat(filePath.c_str(), &fs) != 0){
-            stringstream ss;
-            ss << "File " << filePath << " does not exist" << endl;
-            dfs_log(LL_ERROR) << ss.str();
-            return Status(StatusCode::NOT_FOUND, ss.str());
+        const string& file_path = WrapPath(request->file_name());
+        struct stat file_info;
+
+        stat(file_path.c_str(), &file_info);
+
+        if (stat(file_path.c_str(), &file_info) != 0){
+
+            return Status(StatusCode::NOT_FOUND, "file not found");
         }
 
-        dfs_log(LL_SYSINFO) << "Retrieving file " << filePath;
+        int file_len = file_info.st_size;
+        
+        ifstream ifs(file_path);
+        FileStream file_chunk;
 
-        int fileSize = fs.st_size;
+        int bytes_sent = 0;
 
-        ifstream ifs(filePath);
-        FileChunk chunk;
-        try {
-            int bytesSent = 0;
-            while(!ifs.eof() && bytesSent < fileSize){
-                int bytesToSend = min(fileSize - bytesSent, ChunkSize);
-                char buffer[ChunkSize];
-                if (context->IsCancelled()){
-                    const string& err = "Request deadline has expired";
-                    dfs_log(LL_ERROR) << err;
-                    return Status(StatusCode::DEADLINE_EXCEEDED, err);
-                }
-                ifs.read(buffer, bytesToSend);
-                chunk.set_contents(buffer, bytesToSend);
-                writer->Write(chunk);
-                dfs_log(LL_SYSINFO) << "Returned chunk of size " << bytesToSend << " bytes";
-                bytesSent += bytesToSend;
+        while(bytes_sent < file_len){
+
+            char buff[10240];
+
+            int bytes_remaining = file_len - bytes_sent;
+            if(10240 < bytes_remaining){
+                bytes_remaining = 10240;
             }
-            ifs.close();
-            if (bytesSent != fileSize) {
-                stringstream ss;
-                ss << "The impossible happened" << endl;
-                return Status(StatusCode::INTERNAL, ss.str());
-            }
-        } catch (exception const& e) {
-            stringstream ss;
-            ss << "Error reading file " << e.what() << endl;
-            dfs_log(LL_ERROR) << ss.str();
-            return Status(StatusCode::INTERNAL, ss.str());
+
+            ifs.read(buff, bytes_remaining);
+            file_chunk.set_contents(buff, bytes_remaining);
+            writer->Write(file_chunk);
+            bytes_sent = bytes_sent + bytes_remaining;
         }
 
-        dfs_log(LL_SYSINFO) << "Finished retrieving file " << filePath;
+        ifs.close();
 
         return Status::OK;
     }
 
     Status DeleteFile(
-            ServerContext* context,
-            const File* request,
-            FileAck* response
+        ServerContext* context, 
+        const File* request,
+        ServerResponse* response
     ) override {
-        const string& filePath = WrapPath(request->file_name());
-        dfs_log(LL_SYSINFO) << "Deleting file " << filePath;
-        /* File doesnt exist */
-        FileStatus fs;
-        if (getStat(filePath, &fs) != 0) {
-            stringstream ss;
-            ss << "File " << filePath << " doesn't exist" << endl;
-            dfs_log(LL_ERROR) << ss.str();
-            return Status(StatusCode::NOT_FOUND, ss.str());
+        const string& file_path = WrapPath(request->file_name());
+
+        struct stat file_info;
+        if (stat(file_path.c_str(), &file_info) != 0){
+            return Status(StatusCode::NOT_FOUND, "file not found");
         }
-        if (context->IsCancelled()){
-            const string& err = "Request deadline has expired";
-            dfs_log(LL_ERROR) << err;
-            return Status(StatusCode::DEADLINE_EXCEEDED, err);
-        }
-        /* Delete file */
-        if (remove(filePath.c_str()) != 0) {
-            stringstream ss;
-            ss << "Removing file " << filePath << " failed with: " << strerror(errno) << endl;
-            return Status(StatusCode::INTERNAL, ss.str());
-        }
+
+        remove(file_path.c_str());
+
+        FileStatus file_status;
+
         response->set_file_name(request->file_name());
-        Timestamp* modified = new Timestamp(fs.modified());
+        Timestamp* modified = new Timestamp(file_status.modified());
         response->set_allocated_modified(modified);
-        dfs_log(LL_SYSINFO) << "Deleted file successfully";
         return Status::OK;
     }
 
     Status ListFiles(
-            ServerContext* context,
-            const Empty* request,
-            Files* response
+        ServerContext* context,
+        const VoidArg* request,
+        Files* response
     ) override {
+
         DIR *dir;
+
         if ((dir = opendir(mount_path.c_str())) == NULL) {
-            /* could not open directory */
-            dfs_log(LL_ERROR) << "Failed to open directory at mount path " << mount_path;
             return Status::OK;
         }
-        /* traverse everything in directory */
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            if (context->IsCancelled()){
-                const string& err = "Request deadline has expired";
-                dfs_log(LL_ERROR) << err;
-                return Status(StatusCode::DEADLINE_EXCEEDED, err);
+
+        //a structure type used to return information about directory entries
+        struct dirent *entry;
+
+        //The readdir() function returns a pointer to a structure representing the directory entry
+        // at the current position in the directory stream specified by the argument dirp,
+        // and positions the directory stream at the next entry.
+        // It returns a null pointer upon reaching the end of the directory stream.
+        while ((entry = readdir(dir)) != NULL) {
+
+            //prepare buff path_info to see if the entry is a directory
+            struct stat path_info;
+
+            //string dir_name(entry->d_name);
+
+            string file_path = WrapPath(entry->d_name);
+
+            //obtain information about the named file
+            //and write it to the area pointed to by the buf argument.
+            //stat(file_path.c_str(), &path_info);
+            //skip if file_path is a directory
+
+            if(stat(file_path.c_str(), &path_info) == 0){
+
+                if(path_info.st_mode & S_IFREG){
+                    ServerResponse* file = response->add_file();
+                    FileStatus file_status;
+
+                    struct stat file_info;
+                    if (stat(file_path.c_str(), &file_info) != 0){
+                        return Status(StatusCode::NOT_FOUND, "file not found");
+                    }
+
+                    file_status.set_size(file_info.st_size);
+                    file_status.set_file_name(file_path);
+
+                    Timestamp* modified = new Timestamp(TimeUtil::TimeTToTimestamp(file_info.st_mtime));
+                    Timestamp* created = new Timestamp(TimeUtil::TimeTToTimestamp(file_info.st_ctime));
+                    file_status.set_allocated_modified(modified);
+                    file_status.set_allocated_created(created);
+
+                    file->set_file_name(entry->d_name);
+                    modified = new Timestamp(file_status.modified());
+                    file->set_allocated_modified(modified);
+
+                }
             }
-            struct stat path_stat;
-            string dirEntry(ent->d_name);
-            string path = WrapPath(dirEntry);
-            stat(path.c_str(), &path_stat);
-            /* if dir item is a file */
-            if (!S_ISREG(path_stat.st_mode)){
-                dfs_log(LL_SYSINFO) << "Found dir at " << path << " - Skipping";
-                continue;
-            }
-            dfs_log(LL_SYSINFO) << "Found file at " << path;
-            FileAck* ack = response->add_file();
-            FileStatus status;
-            if (getStat(path, &status) != 0) {
-                stringstream ss;
-                ss << "Getting file info for file " << path << " failed with: " << strerror(errno) << endl;
-                dfs_log(LL_ERROR) << ss.str();
-                return Status(StatusCode::NOT_FOUND, ss.str());
-            }
-            ack->set_file_name(dirEntry);
-            //Timestamp* modified = status.mod
-            Timestamp* modified = new Timestamp(status.modified());
-            ack->set_allocated_modified(modified);
+
+
         }
         closedir(dir);
         return Status::OK;
     }
 
-    Status GetFileStatus(
-            ServerContext* context,
-            const File* request,
-            FileStatus* response
+    Status GetStatus(
+        ServerContext* context,
+        const File* request,
+        FileStatus* response
     ) override {
-        if (context->IsCancelled()){
-            const string& err = "Request deadline has expired";
-            dfs_log(LL_ERROR) << err;
-            return Status(StatusCode::DEADLINE_EXCEEDED, err);
+
+        string file_path = WrapPath(request->file_name());
+
+        struct stat file_info;
+        if (stat(file_path.c_str(), &file_info) != 0){
+            return Status(StatusCode::NOT_FOUND, "file not found");
         }
 
-        string filePath = WrapPath(request->file_name());
-        /* Get FileStatus of file */
-        if (getStat(filePath, response) != 0) {
-            stringstream ss;
-            ss << "Getting file info for file " << filePath << " failed with: " << strerror(errno) << endl;
-            dfs_log(LL_ERROR) << ss.str();
-            return Status(StatusCode::NOT_FOUND, ss.str());
-        }
         return Status::OK;
     }
 
@@ -338,16 +304,16 @@ public:
  * @param mount_path
  */
 DFSServerNode::DFSServerNode(const std::string &server_address,
-                             const std::string &mount_path,
-                             std::function<void()> callback) :
-        server_address(server_address), mount_path(mount_path), grader_callback(callback) {}
+        const std::string &mount_path,
+        std::function<void()> callback) :
+    server_address(server_address), mount_path(mount_path), grader_callback(callback) {}
 
 /**
  * Server shutdown
  */
 DFSServerNode::~DFSServerNode() noexcept {
-dfs_log(LL_SYSINFO) << "DFSServerNode shutting down";
-this->server->Shutdown();
+    dfs_log(LL_SYSINFO) << "DFSServerNode shutting down";
+    this->server->Shutdown();
 }
 
 /** Server start **/

@@ -9,8 +9,8 @@
 #include <mutex>
 
 #include <grpcpp/grpcpp.h>
-#include "CRC.h"
 #include "../proto-src/dfs-service.grpc.pb.h"
+#include "CRC.h"
 
 /**
  * The containing structure used to pass async data

@@ -1,36 +1,45 @@
 #include <regex>
 #include <mutex>
 #include <vector>
-#include <getopt.h>
 #include <string>
 #include <thread>
 #include <cstdio>
 #include <chrono>
-#include <iostream>
 #include <errno.h>
 #include <csignal>
+#include <iostream>
 #include <sstream>
-#include <iomanip>
-#include <unistd.h>
 #include <fstream>
+#include <iomanip>
+#include <getopt.h>
+#include <unistd.h>
 #include <limits.h>
 #include <sys/inotify.h>
 #include <grpcpp/grpcpp.h>
 #include <utime.h>
 
-#include "src/dfslibx-clientnode-p2.h"
 #include "src/dfs-utils.h"
+#include "src/dfslibx-clientnode-p2.h"
 #include "dfslib-shared-p2.h"
 #include "dfslib-clientnode-p2.h"
 #include "proto-src/dfs-service.grpc.pb.h"
+#include <google/protobuf/util/time_util.h>
 
-using grpc::Channel;
 using grpc::Status;
+using grpc::Channel;
 using grpc::StatusCode;
 using grpc::ClientWriter;
 using grpc::ClientReader;
 using grpc::ClientContext;
 
+using google::protobuf::RepeatedPtrField;
+using google::protobuf::util::TimeUtil;
+
+using std::chrono::system_clock;
+using std::chrono::milliseconds;
+
+using namespace dfs_service;
+using namespace std;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -41,12 +50,50 @@ extern dfs_log_level_e DFS_LOG_LEVEL;
 // message types you are using to indicate
 // a file request and a listing of files from the server.
 //
-using FileRequestType = FileRequest;
-using FileListResponseType = FileList;
+using FileRequestType = dfs_service::File;
+using FileListResponseType = dfs_service::Files;
 
 DFSClientNodeP2::DFSClientNodeP2() : DFSClientNode() {}
 DFSClientNodeP2::~DFSClientNodeP2() {}
 
+grpc::StatusCode DFSClientNodeP2::RequestWriteAccess(const std::string &filename) {
+
+    //
+    // STUDENT INSTRUCTION:
+    //
+    // Add your request to obtain a write lock here when trying to store a file.
+    // This method should request a write lock for the given file at the server,
+    // so that the current client becomes the sole creator/writer. If the server
+    // responds with a RESOURCE_EXHAUSTED response, the client should cancel
+    // the current file storage
+    //
+    // The StatusCode response should be:
+    //
+    // OK - if all went well
+    // StatusCode::DEADLINE_EXCEEDED - if the deadline timeout occurs
+    // StatusCode::RESOURCE_EXHAUSTED - if a write lock cannot be obtained
+    // StatusCode::CANCELLED otherwise
+    //
+    //
+
+    ClientContext context;
+    context.AddMetadata("client_id", ClientId());
+
+    File request;
+    request.set_name(filename);
+
+    WriteLock response;
+
+    //pass the specification "AcquireWriteLock" to server
+    //server will run the actual function
+    Status status = service_stub->AcquireWriteLock(&context, request, &response);
+    if (!status.ok()) {
+        return status.error_code();
+    } else{
+        return StatusCode::OK;
+    }
+    
+}
 
 grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
 
@@ -75,30 +122,54 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
     //
     //
 
+    const string& file_path = WrapPath(filename);
+
+    struct stat fs;
+    stat(file_path.c_str(), &fs);
+
+    StatusCode writeLockStatus = this->RequestWriteAccess(filename);
+    if (writeLockStatus != StatusCode::OK) {
+        return StatusCode::RESOURCE_EXHAUSTED;
+    }
+
+    ClientContext context;
+
+    context.AddMetadata("client_id", ClientId());
+    context.AddMetadata("file_name", filename);
+    context.AddMetadata("checksum", to_string(dfs_file_checksum(file_path, &crc_table)));
+    context.AddMetadata("mtime", to_string(static_cast<long>(fs.st_mtime)));
+
+    ServerResponse response;
+
+    //get filesize based on fs which comes from file path
+    int fileSize = fs.st_size;
+
+    unique_ptr<ClientWriter<FileStream>> server_response = service_stub->StoreFile(&context, &response);
+    ifstream ifs(file_path);
+    FileStream chunk;
+    int bytes_sent = 0;
+
+    while(bytes_sent < fileSize){
+          char buffer[10240];
+          int bytes_remain = fileSize - bytes_sent;
+          if (bytes_remain > 10240){
+              bytes_remain = 10240;
+          }
+          ifs.read(buffer, bytes_remain);
+          chunk.set_contents(buffer, bytes_remain);
+          server_response->Write(chunk);
+        bytes_sent += bytes_remain;
+    }
+
+    server_response->WritesDone();
+    Status status = server_response->Finish();
+    if (!status.ok() && status.error_code() == StatusCode::INTERNAL) {
+        return StatusCode::CANCELLED;
+    }
+    return status.error_code();
+
 }
 
-
-grpc::StatusCode DFSClientNodeP2::RequestWriteAccess(const std::string &filename) {
-
-    //
-    // STUDENT INSTRUCTION:
-    //
-    // Add your request to obtain a write lock here when trying to store a file.
-    // This method should request a write lock for the given file at the server,
-    // so that the current client becomes the sole creator/writer. If the server
-    // responds with a RESOURCE_EXHAUSTED response, the client should cancel
-    // the current file storage
-    //
-    // The StatusCode response should be:
-    //
-    // OK - if all went well
-    // StatusCode::DEADLINE_EXCEEDED - if the deadline timeout occurs
-    // StatusCode::RESOURCE_EXHAUSTED - if a write lock cannot be obtained
-    // StatusCode::CANCELLED otherwise
-    //
-    //
-
-}
 
 grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
 
@@ -113,7 +184,7 @@ grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
     // fetched is the same on the client (i.e. the files do not differ
     // between the client and server and a fetch would be unnecessary.
     //
-    // The StatusCode response should be:
+    // The StatusCode server_response should be:
     //
     // OK - if all went well
     // DEADLINE_EXCEEDED - if the deadline timeout occurs
@@ -123,6 +194,39 @@ grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
     //
     // Hint: You may want to match the mtime on local files to the server's mtime
     //
+    const string& file_path = WrapPath(filename);
+
+    ClientContext context;
+    struct stat fs;
+    if (stat(file_path.c_str(), &fs) == 0){
+        context.AddMetadata("mtime", to_string(static_cast<long>(fs.st_mtime)));
+    }
+
+    context.AddMetadata("checksum", to_string(dfs_file_checksum(file_path, &crc_table)));
+
+    File request;
+    request.set_name(filename);
+
+    unique_ptr<ClientReader<FileStream>> server_response = service_stub->FetchFile(&context, request);
+    ofstream ofs;
+    FileStream chunk;
+
+        while (server_response->Read(&chunk)) {
+            if (!ofs.is_open()){
+                ofs.open(file_path, ios::trunc);
+            }
+            ofs << chunk.contents();
+
+        }
+        ofs.close();
+
+    Status status = server_response->Finish();
+    if (!status.ok() && status.error_code() == StatusCode::INTERNAL) {
+        return StatusCode::CANCELLED;
+
+    }
+    return status.error_code();
+
 }
 
 grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
@@ -147,6 +251,24 @@ grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
     //
     //
 
+    StatusCode writeLockStatus = this->RequestWriteAccess(filename);
+    if (writeLockStatus != StatusCode::OK) {
+        return StatusCode::RESOURCE_EXHAUSTED;
+    }
+
+    ClientContext context;
+    context.AddMetadata("client_id", ClientId());
+
+    File request;
+    request.set_name(filename);
+
+    ServerResponse response;
+
+    Status status = service_stub->DeleteFile(&context, request, &response);
+
+    return status.error_code();
+
+
 }
 
 grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool display) {
@@ -167,6 +289,21 @@ grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    ClientContext context;
+
+    VoidArg request;
+    Files response;
+
+    Status status = service_stub->ListFiles(&context, request, &response);
+
+
+    for (const FileStatus& fs : response.file()) {
+        //add file to file map
+        file_map->insert(pair<string,int>(fs.name(), TimeUtil::TimestampToSeconds(fs.modified())));
+    }
+    return status.error_code();
+
 }
 
 grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_status) {
@@ -188,6 +325,21 @@ grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_s
     // StatusCode::CANCELLED otherwise
     //
     //
+    ClientContext context;
+
+    File request;
+    request.set_name(filename);
+    FileStatus response;
+
+    Status status = service_stub->GetStatus(&context, request, &response);
+    if (!status.ok() && status.error_code() == StatusCode::INTERNAL) {
+        return StatusCode::CANCELLED;
+    }
+
+    file_status = &response;
+
+    return status.error_code();
+
 }
 
 void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
@@ -211,9 +363,11 @@ void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
     // the async thread when a file event has been signaled?
     //
 
+    listMutex.lock();
 
     callback();
 
+    listMutex.unlock();
 }
 
 //
@@ -258,20 +412,14 @@ void DFSClientNodeP2::HandleCallbackList() {
             //
 
             // The tag is the memory location of the call_data object
+            // received completion_queue callback
             AsyncClientData<FileListResponseType> *call_data = static_cast<AsyncClientData<FileListResponseType> *>(tag);
-
-            dfs_log(LL_DEBUG2) << "Received completion queue callback";
 
             // Verify that the request was completed successfully. Note that "ok"
             // corresponds solely to the request for updates introduced by Finish().
             // GPR_ASSERT(ok);
-            if (!ok) {
-                dfs_log(LL_ERROR) << "Completion queue callback not ok.";
-            }
 
             if (ok && call_data->status.ok()) {
-
-                dfs_log(LL_DEBUG3) << "Handling async callback ";
 
                 //
                 // STUDENT INSTRUCTION:
@@ -284,13 +432,50 @@ void DFSClientNodeP2::HandleCallbackList() {
                 // Do nothing?
                 //
 
+                listMutex.lock();
 
+                //parse the modifications sent from server
+                for (const FileStatus& remote_status : call_data->reply.file()) {
+                    const string& file_path = WrapPath(remote_status.name());
+
+                    FileStatus local_status;
+                    StatusCode status;
+
+                    struct stat fs;
+                    int local = stat(file_path.c_str(), &fs);
+
+                    if (local != 0) {
+                        //doesn't exist locally, fetching
+                        this->Fetch(remote_status.name());
+
+                    }
+
+                    if(local == 0 && remote_status.modified() > local_status.modified()) {
+                    //local file is out of date
+                        status = this->Fetch(remote_status.name());
+                        if (status == StatusCode::ALREADY_EXISTS) {
+
+                            struct utimbuf ub;
+                            ub.modtime = TimeUtil::TimestampToTimeT(remote_status.modified()); ;
+                            utime(file_path.c_str(), &ub);
+
+                        }
+                    // server out of date
+                    } else if (local == 0 && local_status.modified() > remote_status.modified()) {
+
+                        this->Store(remote_status.name());
+
+                    }
+                }
+
+                listMutex.unlock();
 
             } else {
                 dfs_log(LL_ERROR) << "Status was not ok. Will try again in " << DFS_RESET_TIMEOUT << " milliseconds.";
                 dfs_log(LL_ERROR) << call_data->status.error_message();
                 std::this_thread::sleep_for(std::chrono::milliseconds(DFS_RESET_TIMEOUT));
             }
+
 
             // Once we're complete, deallocate the call_data object.
             delete call_data;
@@ -322,10 +507,5 @@ void DFSClientNodeP2::InitCallbackList() {
     CallbackList<FileRequestType, FileListResponseType>();
 }
 
-//
-// STUDENT INSTRUCTION:
-//
-// Add any additional code you need to here
-//
 
 

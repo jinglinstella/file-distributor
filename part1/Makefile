@@ -1,6 +1,6 @@
 CXX = g++ -Wall -g3 -fPIC
 CPPFLAGS += `pkg-config --cflags protobuf grpc`
-CXXFLAGS += -std=c++14
+CXXFLAGS += -std=c++11
 ASAN_FLAGS = -fsanitize=address -fno-omit-frame-pointer
 ASAN_LIBS = -static-libasan
 LDFLAGS += -L/usr/local/lib `pkg-config --libs protobuf grpc++ grpc`\

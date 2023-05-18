@@ -30,22 +30,3 @@ dfs_log_level_e DFS_LOG_LEVEL = LL_ERROR;
 // be compilable.
 //
 
-const char *FileNameMetadataKey = "file_name";
-int ChunkSize = 5120;
-
-
-/* getStat wraps the `stat` method returning only certain fields in a `FileStatus` type */
-int getStat(string path, FileStatus* fs) {
-    struct stat result;
-    if (stat(path.c_str(), &result) != 0){
-        return -1;
-    }
-    Timestamp* modified = new Timestamp(TimeUtil::TimeTToTimestamp(result.st_mtime));
-    Timestamp* created = new Timestamp(TimeUtil::TimeTToTimestamp(result.st_ctime));
-    fs->set_allocated_modified(modified);
-    fs->set_allocated_created(created);
-    fs->set_size(result.st_size);
-    fs->set_file_name(path);
-    return 0;
-}
-

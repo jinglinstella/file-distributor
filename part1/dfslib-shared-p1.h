@@ -22,16 +22,6 @@
 //
 
 
-// const char* const
-extern const char *FileNameMetadataKey; //= "file_name";
-//extern const string& FileNameMetadataKey;
-//extern const int ChunkSize;
-extern int ChunkSize;
-
-// path
-int getStat(std::string path, dfs_service::FileStatus* fs);
-
 
 #endif
-
 
