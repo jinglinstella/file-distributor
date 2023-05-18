@@ -1,0 +1,3 @@
+/home/vagrant/CLionProjects/untitled1/cmake-build-debug/CMakeFiles/untitled1.dir
+/home/vagrant/CLionProjects/untitled1/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/vagrant/CLionProjects/untitled1/cmake-build-debug/CMakeFiles/rebuild_cache.dir
